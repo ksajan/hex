@@ -781,7 +781,18 @@ pub(crate) fn generate_text(
     deadline: Duration,
     cancelled: &AtomicBool,
 ) -> Result<Generated> {
-    generate_cancellable(prompt, None, deadline, cancelled)
+    generate_cancellable(prompt, None, true, deadline, cancelled)
+}
+
+/// One generation from OpenCode's own default model, with no ranked fallback.
+/// Work that must not contact another provider just because no model was
+/// chosen, such as meeting notes, uses this.
+pub(crate) fn generate_text_default(
+    prompt: &str,
+    deadline: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Generated> {
+    generate_cancellable(prompt, None, false, deadline, cancelled)
 }
 
 /// One generation from exactly `model`, never another provider's: a failure
@@ -792,7 +803,7 @@ pub(crate) fn generate_text_with(
     deadline: Duration,
     cancelled: &AtomicBool,
 ) -> Result<Generated> {
-    generate_cancellable(prompt, Some(model), deadline, cancelled)
+    generate_cancellable(prompt, Some(model), false, deadline, cancelled)
 }
 
 /// Runs one generation and reports it as a processing observation. The text is
@@ -806,7 +817,7 @@ fn generate_observed(
     profile_name: &str,
     started: Instant,
 ) -> (Option<String>, ProcessingObservation) {
-    let result = generate_cancellable(prompt, model, deadline, cancelled);
+    let result = generate_cancellable(prompt, model, true, deadline, cancelled);
     let (text, fallback) = match result.map(|generated| generated.text) {
         Ok(text) if !text.trim().is_empty() => (Some(text.trim().into()), None),
         Ok(_) => (None, Some("processor returned empty text".into())),
@@ -1262,13 +1273,14 @@ struct ResponseData {
 
 #[cfg(test)]
 fn generate(prompt: &str, model: Option<&Model>, deadline: Duration) -> Result<String> {
-    generate_cancellable(prompt, model, deadline, &AtomicBool::new(false))
+    generate_cancellable(prompt, model, true, deadline, &AtomicBool::new(false))
         .map(|generated| generated.text)
 }
 
 fn generate_cancellable(
     prompt: &str,
     model: Option<&Model>,
+    ranked: bool,
     deadline: Duration,
     cancelled: &AtomicBool,
 ) -> Result<Generated> {
@@ -1293,11 +1305,15 @@ fn generate_cancellable(
         prompt,
         model,
         || {
-            ranked_candidates_for(
-                &service,
-                deadline.saturating_sub(started.elapsed()),
-                cancelled,
-            )
+            if ranked {
+                ranked_candidates_for(
+                    &service,
+                    deadline.saturating_sub(started.elapsed()),
+                    cancelled,
+                )
+            } else {
+                Vec::new()
+            }
         },
         forget_ranked_candidates,
         started,
@@ -2370,6 +2386,7 @@ mod tests {
         let error = generate_cancellable(
             "Rewrite this.",
             None,
+            true,
             Duration::ZERO,
             &AtomicBool::new(false),
         )
@@ -2378,6 +2395,7 @@ mod tests {
         let error = generate_cancellable(
             "Rewrite this.",
             None,
+            true,
             Duration::from_secs(1),
             &AtomicBool::new(true),
         )
@@ -2580,6 +2598,34 @@ mod tests {
         let catalog3 = build_model_catalog(only_nano, Some(heavy_default));
         assert_eq!(catalog3.default_key.as_deref(), Some("openai/gpt-5.4-nano"));
         assert_eq!(catalog3.default_variant.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn a_default_generation_skips_ranked_candidates_and_asks_for_no_model() {
+        let mut posts = 0;
+        let output = generate_with_candidates(
+            "Summarize this.",
+            None,
+            Vec::new,
+            || {},
+            Instant::now(),
+            Duration::from_secs(5),
+            &AtomicBool::new(false),
+            |data, _remaining, _cancelled| {
+                posts += 1;
+                let request: serde_json::Value = serde_json::from_str(data).unwrap();
+                assert!(request.get("model").is_none());
+                Ok(Response::Success {
+                    data: ResponseData {
+                        text: "OpenCode default".into(),
+                    },
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(output.text, "OpenCode default");
+        assert_eq!(output.model, None);
+        assert_eq!(posts, 1);
     }
 
     #[test]

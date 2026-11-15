@@ -32,8 +32,8 @@ const MODEL_FIELD_WIDTH: f32 = 240.0;
 pub(super) enum Target {
     Mode(Selection),
     /// `meetings.opencode_model` (Meetings › Settings › Summaries): no
-    /// thinking variant, and its default entry clears it, so Hex picks one
-    /// of its fast models.
+    /// thinking variant, and its default entry clears it, so Hex asks
+    /// OpenCode's default model rather than choosing a provider itself.
     MeetingSummary,
 }
 
