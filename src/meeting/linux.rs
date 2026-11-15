@@ -30,6 +30,8 @@ const QUEUE_PER_CAPTURE: usize = 128;
 const QUEUE_CAPACITY: usize = 1_024;
 /// How often the source checks that the outputs to capture have not changed.
 const ROUTE_CHECK: Duration = Duration::from_secs(2);
+/// How long a capture that ended waits before it is tried again.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// The PipeWire node every system audio monitor presents.
 const NODE_NAME: &str = "hex-meeting-system-audio";
 const NODE_DESCRIPTION: &str = "Hex meeting system audio";
@@ -82,6 +84,9 @@ struct MonitorSource {
     /// default output. A changed list reopens the source.
     sinks: Vec<String>,
     buffers: Receiver<MonitorEvent>,
+    /// Kept so a capture that ended can be started again.
+    sender: SyncSender<MonitorEvent>,
+    executable: PathBuf,
     last_audio: Instant,
     route_checked: Instant,
     /// The last capture's exit, so the all-closed error can name it.
@@ -96,6 +101,15 @@ struct Output {
     /// `None` once this capture ended; the others keep the track going.
     child: Option<Child>,
     pending: Vec<f32>,
+    /// When to try this output again after its capture ended.
+    retry_at: Option<Instant>,
+}
+
+impl Output {
+    /// Whether this capture ended and is due to be started again.
+    fn retry_due(&self, now: Instant) -> bool {
+        self.child.is_none() && self.retry_at.is_some_and(|at| now >= at)
+    }
 }
 
 /// What one capture sends: its 16 kHz audio as `index` into `outputs`, or that
@@ -178,6 +192,7 @@ impl MonitorSource {
                     sink: target.map(str::to_owned),
                     child: Some(child),
                     pending: Vec::new(),
+                    retry_at: None,
                 }),
                 Err(error) => {
                     tracing::warn!(
@@ -189,9 +204,6 @@ impl MonitorSource {
                 }
             }
         }
-        // Every reader thread holds its own sender, so a source with no
-        // capture left reports it as disconnected.
-        drop(sender);
         if outputs.is_empty() {
             return Err(
                 first_error.unwrap_or_else(|| eyre!("no audio output is available to capture"))
@@ -206,6 +218,8 @@ impl MonitorSource {
             outputs,
             sinks,
             buffers,
+            sender,
+            executable,
             last_audio: Instant::now(),
             route_checked: Instant::now(),
             last_exit: None,
@@ -239,6 +253,7 @@ impl MonitorSource {
             let _ = child.kill();
             let _ = child.wait();
             output.pending.clear();
+            output.retry_at = Some(Instant::now() + RETRY_DELAY);
             let sink = output.sink.as_deref().unwrap_or("the default output");
             match status {
                 Some(status) => format!("{sink}: pw-record exited ({status})"),
@@ -247,6 +262,46 @@ impl MonitorSource {
         };
         tracing::warn!(%reason, "system audio monitor stopped");
         self.last_exit = Some(reason);
+    }
+
+    /// Starts a capture that ended again while the other outputs keep
+    /// recording. A Bluetooth sink is recreated when the card switches to
+    /// HFP for the microphone; its capture exits even though the sink comes
+    /// back, so retry it instead of dropping that output for the meeting.
+    fn retry_closed(&mut self) {
+        if self.outputs.iter().all(|output| output.child.is_none()) {
+            return;
+        }
+        let now = Instant::now();
+        let executable = self.executable.clone();
+        for (index, output) in self.outputs.iter_mut().enumerate() {
+            if !output.retry_due(now) {
+                continue;
+            }
+            match spawn_monitor(
+                &executable,
+                output.sink.as_deref(),
+                index,
+                self.sender.clone(),
+            ) {
+                Ok(child) => {
+                    output.child = Some(child);
+                    output.retry_at = None;
+                    tracing::info!(
+                        sink = output.sink.as_deref().unwrap_or("the default output"),
+                        "system audio monitor restarted"
+                    );
+                }
+                Err(error) => {
+                    output.retry_at = Some(now + RETRY_DELAY);
+                    tracing::warn!(
+                        sink = output.sink.as_deref().unwrap_or("the default output"),
+                        error = %format!("{error:#}"),
+                        "could not restart an audio output"
+                    );
+                }
+            }
+        }
     }
 
     /// Whether the outputs to capture changed since they were opened. A sound
@@ -364,6 +419,7 @@ fn read_monitor(mut stdout: ChildStdout, index: usize, sender: SyncSender<Monito
 
 impl LiveSource for MonitorSource {
     fn poll(&mut self, sink: &PacketSink) -> std::result::Result<(), String> {
+        self.retry_closed();
         if self.route_checked.elapsed() >= ROUTE_CHECK {
             self.route_checked = Instant::now();
             if self.route_changed() {
@@ -584,6 +640,22 @@ mod tests {
         assert!(!route_needs_reopen(&open, None));
         assert!(!route_needs_reopen(&open, Some(&["speakers".to_owned()])));
         assert!(route_needs_reopen(&open, Some(&[])));
+    }
+
+    #[test]
+    fn a_closed_capture_is_retried_after_a_delay() {
+        let now = Instant::now();
+        let mut output = Output {
+            sink: Some("bluez_output.AA_BB_CC_DD_EE_FF.1".into()),
+            child: None,
+            pending: Vec::new(),
+            retry_at: Some(now + RETRY_DELAY),
+        };
+        assert!(!output.retry_due(now));
+        assert!(output.retry_due(now + RETRY_DELAY));
+        // A capture that is still running is never retried.
+        output.retry_at = None;
+        assert!(!output.retry_due(now));
     }
 
     #[test]
